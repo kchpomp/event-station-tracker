@@ -28,3 +28,5 @@ dist-ssr
 # Internal project reference docs — kept locally for Claude Code, not published
 CLAUDE.md
 production_setup.md
+beget_supabase_hosting.md
+local_dev_guide.md

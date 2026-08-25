@@ -265,14 +265,17 @@ function showModal({ title, message, variant = 'success', autoCloseMs, onClose }
     </div>
   `
   document.body.appendChild(overlay)
-  let timer
-  const close = () => {
-    if (timer) clearTimeout(timer)
-    overlay.remove()
-    if (onClose) onClose()
+  // Manual OK just hides the popup and leaves the user exactly where they
+  // are — it does not run onClose. onClose (the dashboard redirect or
+  // camera reopen) only fires from the autoCloseMs timer below, whether
+  // or not the user dismissed the popup early.
+  document.getElementById('modalCloseBtn').onclick = () => overlay.remove()
+  if (autoCloseMs) {
+    setTimeout(() => {
+      overlay.remove()
+      if (onClose) onClose()
+    }, autoCloseMs)
   }
-  document.getElementById('modalCloseBtn').onclick = close
-  if (autoCloseMs) timer = setTimeout(close, autoCloseMs)
 }
 
 async function stopActiveScanner() {
@@ -317,6 +320,7 @@ function renderScan() {
         title: 'Камера недоступна',
         message: 'Не удалось получить доступ к камере. Проверьте разрешения браузера и повторите попытку.',
         variant: 'error',
+        autoCloseMs: 3000,
         onClose: () => renderScan(),
       })
     })
@@ -338,6 +342,7 @@ async function handleScan(decodedText) {
       title: 'Ошибка сканирования',
       message: error.message,
       variant: 'error',
+      autoCloseMs: 3000,
       onClose: () => renderScan(),
     })
     return
