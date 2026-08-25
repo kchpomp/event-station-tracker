@@ -24,3 +24,7 @@ dist-ssr
 *.njsproj
 *.sln
 *.sw?
+
+# Internal project reference docs — kept locally for Claude Code, not published
+CLAUDE.md
+production_setup.md

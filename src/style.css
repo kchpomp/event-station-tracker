@@ -75,8 +75,5 @@ ul, ol { padding-left: 1.2rem; }
 .modal-box h3 { margin-top: 0.25rem; }
 .modal-box button { margin-top: 1rem; }
 
-.upload-divider { text-align: center; color: #6b7280; font-size: 0.9rem; margin: 1rem 0 0.5rem; }
-label[for="qrFileInput"] { font-size: 0.9rem; color: #374151; margin-bottom: 0.25rem; }
-
 .switch-link { text-align: center; font-size: 0.85rem; color: #6b7280; margin-top: 0.75rem; }
 .switch-link a { color: #4f46e5; }

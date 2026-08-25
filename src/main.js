@@ -20,6 +20,15 @@ function translateError(message) {
   return AUTH_ERROR_MESSAGES[message] || message
 }
 
+// display_name and station names are user/organizer-supplied and end up in
+// innerHTML (e.g. shown to every viewer on the leaderboard) — escape them
+// so a name like "<img src=x onerror=...>" can't run as a stored XSS.
+function escapeHtml(str) {
+  return String(str).replace(/[&<>"']/g, (c) => ({
+    '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;',
+  }[c]))
+}
+
 async function getSession() {
   const { data: { session } } = await supabase.auth.getSession()
   return session
@@ -92,31 +101,43 @@ function renderLogin() {
       <p class="switch-link">Нет аккаунта? <a href="#register">Зарегистрироваться</a></p>
     </div>
   `
-  document.getElementById('loginBtn').onclick = async () => {
+  const loginBtn = document.getElementById('loginBtn')
+  loginBtn.onclick = async () => {
     const nickname = document.getElementById('nickname').value.trim()
     const password = document.getElementById('password').value
     const errorEl = document.getElementById('authError')
+    errorEl.textContent = ''
+    // Guards against a double-click firing two overlapping login attempts,
+    // which otherwise briefly shows an error even when the second attempt
+    // is about to succeed.
+    loginBtn.disabled = true
+    loginBtn.textContent = 'Выполняется вход…'
 
-    // Supabase Auth only knows email+password — nickname login means
-    // resolving nickname -> email first via get_email_by_nickname (see
-    // Part 3), then signing in with the resolved email underneath.
-    const { data: email, error: lookupError } = await supabase.rpc('get_email_by_nickname', { p_nickname: nickname })
-    if (lookupError || !email) {
-      // Deliberately the same generic message as a wrong password below,
-      // rather than "nickname not found" — no need to confirm which
-      // nicknames exist via the error text on top of what the lookup
-      // function itself already reveals.
-      errorEl.textContent = 'Неверный никнейм или пароль.'
-      return
-    }
+    try {
+      // Supabase Auth only knows email+password — nickname login means
+      // resolving nickname -> email first via get_email_by_nickname (see
+      // Part 3), then signing in with the resolved email underneath.
+      const { data: email, error: lookupError } = await supabase.rpc('get_email_by_nickname', { p_nickname: nickname })
+      if (lookupError || !email) {
+        // Deliberately the same generic message as a wrong password below,
+        // rather than "nickname not found" — no need to confirm which
+        // nicknames exist via the error text on top of what the lookup
+        // function itself already reveals.
+        errorEl.textContent = 'Неверный никнейм или пароль.'
+        return
+      }
 
-    const { error } = await supabase.auth.signInWithPassword({ email, password })
-    if (error) {
-      errorEl.textContent = translateError(error.message)
-      return
+      const { error } = await supabase.auth.signInWithPassword({ email, password })
+      if (error) {
+        errorEl.textContent = translateError(error.message)
+        return
+      }
+      window.location.hash = 'dashboard'
+      render()
+    } finally {
+      loginBtn.disabled = false
+      loginBtn.textContent = 'Войти'
     }
-    window.location.hash = 'dashboard'
-    render()
   }
 }
 
@@ -133,7 +154,8 @@ function renderRegister() {
       <p class="switch-link">Уже есть аккаунт? <a href="#login">Войти</a></p>
     </div>
   `
-  document.getElementById('registerBtn').onclick = async () => {
+  const registerBtn = document.getElementById('registerBtn')
+  registerBtn.onclick = async () => {
     const nickname = document.getElementById('nickname').value.trim()
     const password = document.getElementById('password').value
     const labelName = document.getElementById('labelName').value.trim()
@@ -145,43 +167,74 @@ function renderRegister() {
       return
     }
 
-    const { error } = await supabase.auth.signUp({
-      email, password,
-      options: {
-        data: { nickname, display_name: labelName },
-        // BASE_URL is Vite's built-in env var matching vite.config.js's
-        // `base` — this keeps the confirmation link pointed at wherever
-        // the app is actually deployed without hardcoding the repo name
-        // a second time.
-        emailRedirectTo: window.location.origin + import.meta.env.BASE_URL,
-      },
-    })
-    if (error) {
-      errorEl.textContent = translateError(error.message)
-      return
+    errorEl.textContent = ''
+    registerBtn.disabled = true
+    registerBtn.textContent = 'Регистрация…'
+
+    try {
+      const { error } = await supabase.auth.signUp({
+        email, password,
+        options: {
+          data: { nickname, display_name: labelName },
+          // BASE_URL is Vite's built-in env var matching vite.config.js's
+          // `base` — this keeps the confirmation link pointed at wherever
+          // the app is actually deployed without hardcoding the repo name
+          // a second time.
+          emailRedirectTo: window.location.origin + import.meta.env.BASE_URL,
+        },
+      })
+      if (error) {
+        errorEl.textContent = translateError(error.message)
+        return
+      }
+      app.innerHTML = `
+        <div class="card">
+          <h2>Проверьте почту</h2>
+          <p>Мы отправили письмо на ${escapeHtml(email)}. Перейдите по ссылке из письма, чтобы подтвердить регистрацию — после этого вы автоматически попадёте на главную страницу со списком станций.</p>
+        </div>
+      `
+    } finally {
+      registerBtn.disabled = false
+      registerBtn.textContent = 'Зарегистрироваться'
     }
-    app.innerHTML = `
-      <div class="card">
-        <h2>Проверьте почту</h2>
-        <p>Мы отправили письмо на ${email}. Перейдите по ссылке из письма, чтобы подтвердить регистрацию — после этого вы автоматически попадёте на главную страницу со списком станций.</p>
-      </div>
-    `
   }
 }
 
 async function renderDashboard(session) {
-  const { data: stations } = await supabase.from('stations').select('*').eq('is_active', true)
-  const { data: visits } = await supabase
+  const { data: profile, error: profileError } = await supabase
+    .from('profiles')
+    .select('display_name')
+    .eq('id', session.user.id)
+    .single()
+  const { data: stations, error: stationsError } = await supabase.from('stations').select('*').eq('is_active', true)
+  const { data: visits, error: visitsError } = await supabase
     .from('station_visits')
     .select('*')
     .eq('participant_id', session.user.id)
 
+  if (profileError || stationsError || visitsError) {
+    app.innerHTML = `
+      <div class="card">
+        <h2>Не удалось загрузить данные</h2>
+        <p class="error">Попробуйте обновить страницу.</p>
+        <button id="logoutBtn">Выйти</button>
+      </div>
+    `
+    document.getElementById('logoutBtn').onclick = async () => {
+      await supabase.auth.signOut()
+      window.location.hash = 'landing'
+      render()
+    }
+    return
+  }
+
   const totalPoints = (visits || []).reduce((sum, v) => sum + v.points_awarded, 0)
   const completedIds = new Set((visits || []).map((v) => v.station_id))
+  const displayName = escapeHtml(profile?.display_name || 'Участник')
 
   app.innerHTML = `
     <div class="card">
-      <h2>Ваш прогресс</h2>
+      <h2>Ваш текущий прогресс, ${displayName}:</h2>
       <p>Очки: <strong>${totalPoints}</strong> — станций пройдено: ${completedIds.size}/${(stations || []).length}</p>
       <button onclick="location.hash='scan'">Сканировать станцию</button>
       <button onclick="location.hash='leaderboard'">Таблица лидеров</button>
@@ -189,7 +242,7 @@ async function renderDashboard(session) {
       <h3>Станции</h3>
       <ul>
         ${(stations || [])
-          .map((s) => `<li>${completedIds.has(s.id) ? '✅' : '⬜️'} ${s.name} — ${s.points} очков</li>`)
+          .map((s) => `<li>${completedIds.has(s.id) ? '✅' : '⬜️'} ${escapeHtml(s.name)} — ${s.points} очков</li>`)
           .join('')}
       </ul>
     </div>
@@ -201,7 +254,7 @@ async function renderDashboard(session) {
   }
 }
 
-function showModal({ title, message, variant = 'success', onClose }) {
+function showModal({ title, message, variant = 'success', autoCloseMs, onClose }) {
   const overlay = document.createElement('div')
   overlay.className = 'modal-overlay'
   overlay.innerHTML = `
@@ -212,10 +265,14 @@ function showModal({ title, message, variant = 'success', onClose }) {
     </div>
   `
   document.body.appendChild(overlay)
-  document.getElementById('modalCloseBtn').onclick = () => {
+  let timer
+  const close = () => {
+    if (timer) clearTimeout(timer)
     overlay.remove()
     if (onClose) onClose()
   }
+  document.getElementById('modalCloseBtn').onclick = close
+  if (autoCloseMs) timer = setTimeout(close, autoCloseMs)
 }
 
 async function stopActiveScanner() {
@@ -230,9 +287,6 @@ function renderScan() {
     <div class="card">
       <h2>Сканировать QR-код станции</h2>
       <div id="reader"></div>
-      <p class="upload-divider">— или —</p>
-      <label for="qrFileInput">Загрузить изображение QR-кода</label>
-      <input type="file" id="qrFileInput" accept="image/*" />
       <button id="backBtn">Назад</button>
     </div>
   `
@@ -259,26 +313,13 @@ function renderScan() {
       () => {} // called every frame with no result found yet — intentionally silent
     )
     .catch(() => {
-      // Camera unavailable or permission denied — the file upload below
-      // still works, so there's no need to surface an error here too.
-    })
-
-  document.getElementById('qrFileInput').onchange = async (e) => {
-    const file = e.target.files[0]
-    if (!file) return
-    await stopActiveScanner()
-    try {
-      const fileScanner = new Html5Qrcode('reader')
-      const decodedText = await fileScanner.scanFile(file, false)
-      await handleScan(decodedText)
-    } catch (err) {
       showModal({
-        title: 'Не удалось распознать QR-код',
-        message: 'Изображение не удалось прочитать как QR-код. Проверьте, что вокруг кода есть белое поле без обрезки, размер не меньше нескольких сотен пикселей, и фон не прозрачный.',
+        title: 'Камера недоступна',
+        message: 'Не удалось получить доступ к камере. Проверьте разрешения браузера и повторите попытку.',
         variant: 'error',
+        onClose: () => renderScan(),
       })
-    }
-  }
+    })
 }
 
 async function handleScan(decodedText) {
@@ -290,9 +331,15 @@ async function handleScan(decodedText) {
   }
   const { data, error } = await supabase.rpc('scan_station', { p_token: token })
   if (error) {
-    // The image decoded fine, but the token it contained doesn't match any
-    // station — a different failure than the file not decoding at all.
-    showModal({ title: 'Ошибка сканирования', message: error.message, variant: 'error' })
+    // Decoded fine, but the backend rejected it (invalid token, inactive
+    // station/event, ...) — stay on this screen and let them try again,
+    // rather than bouncing them back to the dashboard on a failed scan.
+    showModal({
+      title: 'Ошибка сканирования',
+      message: error.message,
+      variant: 'error',
+      onClose: () => renderScan(),
+    })
     return
   }
   const [{ points_awarded, total_points, already_completed }] = data
@@ -304,6 +351,7 @@ async function handleScan(decodedText) {
       title: 'Уже отсканировано',
       message: `Вы уже получили очки за эту станцию. Ваш текущий счёт: ${total_points}.`,
       variant: 'warning',
+      autoCloseMs: 3000,
       onClose: () => { window.location.hash = 'dashboard'; render() },
     })
   } else {
@@ -311,21 +359,22 @@ async function handleScan(decodedText) {
       title: 'Очки начислены!',
       message: `+${points_awarded} очков — ваш счёт теперь ${total_points}.`,
       variant: 'success',
+      autoCloseMs: 3000,
       onClose: () => { window.location.hash = 'dashboard'; render() },
     })
   }
 }
 
 async function renderLeaderboard() {
-  const { data: leaderboard } = await supabase.rpc('get_leaderboard').limit(20)
+  const { data: leaderboard, error } = await supabase.rpc('get_leaderboard').limit(20)
   // get_leaderboard is a `stable` function, so PostgREST treats it like a
   // read endpoint and .limit()/.order() chain onto it the same as a table.
   app.innerHTML = `
     <div class="card">
       <h2>Таблица лидеров</h2>
-      <ol>
-        ${(leaderboard || []).map((row) => `<li>${row.display_name} — ${row.total_points} очков</li>`).join('')}
-      </ol>
+      ${error
+        ? `<p class="error">Не удалось загрузить таблицу лидеров. Попробуйте ещё раз.</p>`
+        : `<ol>${(leaderboard || []).map((row) => `<li>${escapeHtml(row.display_name)} — ${row.total_points} очков</li>`).join('') || '<li>Пока никто не набрал очков.</li>'}</ol>`}
       <button onclick="location.hash='dashboard'">Назад</button>
     </div>
   `
