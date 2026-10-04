@@ -9,8 +9,16 @@ import { createClient } from '@supabase/supabase-js'
 // only matters once real emails are involved (Part 15) — without it, an
 // email confirmation link would land the participant on a page whose
 // hash the router doesn't recognize, not on their dashboard.
-export const supabase = createClient(
-  import.meta.env.VITE_SUPABASE_URL,
-  import.meta.env.VITE_SUPABASE_ANON_KEY,
-  { auth: { flowType: 'pkce' } }
-)
+let client
+// Dev-only preview (TESTING.md): needs BOTH `npm run dev` and ?preview=1. import.meta.env.DEV is replaced
+// by `false` at build time, so in a production build this branch and src/preview.js are removed entirely.
+if (import.meta.env.DEV && new URLSearchParams(location.search).get('preview') === '1') {
+  client = (await import('./preview.js')).previewClient()
+} else {
+  client = createClient(
+    import.meta.env.VITE_SUPABASE_URL,
+    import.meta.env.VITE_SUPABASE_ANON_KEY,
+    { auth: { flowType: 'pkce' } }
+  )
+}
+export const supabase = client

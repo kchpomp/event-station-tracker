@@ -25,8 +25,11 @@ dist-ssr
 *.sln
 *.sw?
 
-# Internal project reference docs — kept locally for Claude Code, not published
-CLAUDE.md
-production_setup.md
-beget_supabase_hosting.md
-local_dev_guide.md
+# Private / local-only — never publish
+*.md
+supabase/
+.env*
+*.pem
+*.key
+.claude/
+.playwright-mcp/
