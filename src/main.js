@@ -3,7 +3,7 @@ import '@fontsource/playfair-display/latin-600.css'
 import { supabase } from './supabaseClient.js'
 import { Html5Qrcode } from 'html5-qrcode'
 import { CONSENT_TEXT } from './consent.js'
-import { DIFFUSION_COPY, DIFFUSION_TASK_QUESTIONS, IDEAS_COPY, POLYMER, RESOURCE_NAMES, RESOURCES_COPY, STATION_COPY, STATION_DEFAULT } from './content.js'
+import { DIFFUSION_COPY, DIFFUSION_TASK_QUESTIONS, IDEAS_COPY, POLYMER, STATION_COPY, STATION_DEFAULT } from './content.js'
 // Icons: one set (Phosphor, regular weight), imported file by file so only these end up in the bundle.
 import shareNetwork from '@phosphor-icons/core/assets/regular/share-network.svg?raw'
 import videoCamera from '@phosphor-icons/core/assets/regular/video-camera.svg?raw'
@@ -15,18 +15,17 @@ import flask from '@phosphor-icons/core/assets/regular/flask.svg?raw'
 
 const app = document.getElementById('app')
 let activeScanner = null
-let knownConnections = null // diffusion count as last seen, to tell "already connected" from "new"
 
 const BRAND = 'Формула <span>Будущего</span>'
 const SCAN_ROUTES = ['#scan', '#diffusion-scan']
 const DIFFUSION_GOAL = 3
-const IDEA_GOAL = 5 // ideas beyond this are accepted but not scored (get_leaderboard() / get_my_progress())
+const BOARD_SIZE = 10 // rows of the leaderboard
+const IDEA_GOAL = 5 // ideas beyond this are accepted but not scored (log_idea_points())
 
 // Supabase/RPC error strings are English; map the ones users can hit here
-// rather than leaking them into the Russian UI. Unmapped messages fall
-// through unchanged so unexpected errors stay visible.
+// rather than leaking them into the Russian UI.
 const ERROR_MESSAGES = {
-  'Invalid login credentials': 'Неверный никнейм или пароль.',
+  'Invalid login credentials': 'Неверный email или пароль.',
   'User already registered': 'Пользователь с таким email уже зарегистрирован.',
   'Password should be at least 6 characters': 'Пароль должен содержать не менее 6 символов.',
   'Email not confirmed': 'Email не подтверждён. Проверьте почту и перейдите по ссылке из письма.',
@@ -38,8 +37,18 @@ const ERROR_MESSAGES = {
   'invalid participant token': 'Это не QR-код участника. Попросите собеседника нажать «Показать мой QR».',
   'cannot connect with yourself': 'Нельзя создать связь с самим собой.',
   'participant is from the same city and company': 'Нужен участник из другого города или с другого предприятия.',
+  'Failed to fetch': 'Нет связи с сервером. Проверьте интернет и попробуйте ещё раз.',
+  'Email rate limit exceeded': 'Слишком много попыток. Подождите немного и повторите.',
+  'email rate limit exceeded': 'Слишком много попыток. Подождите немного и повторите.',
 }
-const translateError = (message) => ERROR_MESSAGES[message] || message
+// Everything NOT listed above (raw database / server text, which can echo what a person typed) is logged for the
+// developer and replaced by one generic line: nothing raw is ever shown to a participant.
+const GENERIC_ERROR = 'Что-то пошло не так. Попробуйте ещё раз.'
+const translateError = (message) => {
+  if (ERROR_MESSAGES[message]) return ERROR_MESSAGES[message]
+  console.error('unmapped error:', message)
+  return GENERIC_ERROR
+}
 
 // Participant names and station names are user/organizer-supplied and end up in
 // innerHTML (the leaderboard shows them to everyone) — escape them so a name
@@ -50,9 +59,8 @@ function escapeHtml(str) {
   }[c]))
 }
 
-// The public name everywhere is "Имя Фамилия". Accounts from before those fields existed fall back to
-// their nickname (get_leaderboard() applies the same rule in SQL).
-const fullName = (p) => [p.first_name, p.last_name].filter(Boolean).join(' ') || p.nickname || 'Участник'
+// The public name everywhere is "Имя Фамилия" (get_leaderboard() applies the same fallback in SQL).
+const fullName = (p) => [p.first_name, p.last_name].filter(Boolean).join(' ') || 'Участник'
 
 const svg = (body, w = 2) =>
   `<svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="${w}" stroke-linecap="round" stroke-linejoin="round" width="20" height="20" aria-hidden="true">${body}</svg>`
@@ -79,9 +87,18 @@ const STATION_ICON = {
 }
 const ACTIVITY_ICON = { diffusion: usersThree, ideas: flask }
 const glyph = (raw) => raw.replace('<svg ', '<svg aria-hidden="true" ')
+const stationIcon = (name) => (STATION_ICON[name] ? glyph(STATION_ICON[name]) : ICON.pin)
+// These stations are entered through the global «Сканировать QR-код» button on the dashboard, so their pages have none.
+const hasOwnScanButton = (name) => !(/^(точка соединения|люди формулы будущего|воркшоп)/i.test(name))
 
 // Connected dots in miniature: the same node-and-line language as HERO_NET, used on the «Полимер решений» link.
 const POLY_CHAIN = `<svg class="poly-chain" viewBox="0 0 72 24" aria-hidden="true"><path d="M6 17L22 7L40 16L58 6L67 12" fill="none" stroke="currentColor" stroke-width="1.4"/><g fill="currentColor"><circle cx="6" cy="17" r="3"/><circle cx="22" cy="7" r="4"/><circle cx="40" cy="16" r="3.5"/><circle cx="58" cy="6" r="4"/><circle cx="67" cy="12" r="2.5"/></g></svg>`
+
+let renderedHash = null // the route the screen currently shows (or is loading)
+const FETCH_ROUTES = ['dashboard', 'diffusion', 'ideas', 'profile', 'polymer']
+const showLoading = () => {
+  app.innerHTML = '<div class="loading" role="status"><span class="spinner" aria-hidden="true"></span><p>Загрузка…</p></div>'
+}
 
 async function render() {
   // Any re-render (route change, auth event) must release the camera first —
@@ -94,6 +111,12 @@ async function render() {
     window.location.hash = 'landing'
     return
   }
+
+  // The pages that wait on the database show a loading screen until their data is here (or an error replaces it).
+  // Only when the route changes: a re-render of the same route (an auth event, say) keeps the page on screen until the
+  // fresh data arrives, instead of blanking it.
+  if ((FETCH_ROUTES.includes(hash) || hash.startsWith('station/')) && hash !== renderedHash) showLoading()
+  renderedHash = hash
 
   if (hash === 'landing') return renderLanding()
   if (hash === 'login') return renderLogin()
@@ -155,8 +178,8 @@ const field = (id, label, extra = '') =>
 function renderLogin() {
   app.innerHTML = authShell('login', `
     <form class="form" id="loginForm">
-      ${field('nickname', 'Никнейм', 'name="username" autocomplete="username" placeholder="ваш_никнейм" autocapitalize="off" autocorrect="off" spellcheck="false"')}
-      ${field('password', 'Пароль', 'name="password" type="password" autocomplete="current-password" enterkeyhint="go" placeholder="••••••••"')}
+      ${field('email', 'Email', 'name="email" type="email" autocomplete="username" placeholder="вы@email.com" autocapitalize="off" autocorrect="off" spellcheck="false" maxlength="254"')}
+      ${field('password', 'Пароль', 'name="password" type="password" autocomplete="current-password" enterkeyhint="go" placeholder="••••••••" maxlength="72"')}
       <button type="submit" id="loginBtn">Войти</button>
       <p id="authError" class="error"></p>
     </form>
@@ -164,27 +187,17 @@ function renderLogin() {
   const loginBtn = document.getElementById('loginBtn')
   document.getElementById('loginForm').onsubmit = async (e) => {
     e.preventDefault()
-    const nickname = document.getElementById('nickname').value.trim()
+    const email = document.getElementById('email').value.trim()
     const password = document.getElementById('password').value
     const errorEl = document.getElementById('authError')
     errorEl.textContent = ''
     // Guards against a double-tap firing two overlapping login attempts,
     // which otherwise briefly shows an error even when the second succeeds.
     loginBtn.disabled = true
+    loginBtn.classList.add('busy')
     loginBtn.textContent = 'Выполняется вход…'
 
     try {
-      // Supabase Auth only knows email+password — nickname login means
-      // resolving nickname -> email first via get_email_by_nickname, then
-      // signing in with the resolved email underneath.
-      const { data: email, error: lookupError } = await supabase.rpc('get_email_by_nickname', { p_nickname: nickname })
-      if (lookupError || !email) {
-        // Same generic message as a wrong password below, so the error text
-        // doesn't confirm which nicknames exist.
-        errorEl.textContent = 'Неверный никнейм или пароль.'
-        return
-      }
-
       const { error } = await supabase.auth.signInWithPassword({ email, password })
       if (error) {
         errorEl.textContent = translateError(error.message)
@@ -194,6 +207,7 @@ function renderLogin() {
       render()
     } finally {
       loginBtn.disabled = false
+      loginBtn.classList.remove('busy')
       loginBtn.textContent = 'Войти'
     }
   }
@@ -207,13 +221,12 @@ function renderRegister() {
   const req = (id, label, extra) => field(id, `${label} <span class="req" aria-hidden="true">*</span>`, extra)
   app.innerHTML = authShell('register', `
     <form class="form" id="registerForm" novalidate>
-      ${req('nickname', 'Никнейм (для входа)', 'name="username" autocomplete="username" placeholder="ваш_ник" autocapitalize="off" autocorrect="off" spellcheck="false"')}
-      ${req('firstName', 'Имя', 'autocomplete="given-name"')}
-      ${req('lastName', 'Фамилия', 'autocomplete="family-name"')}
-      ${req('company', 'Предприятие / подразделение', 'autocomplete="organization"')}
-      ${req('city', 'Город', 'autocomplete="address-level2"')}
-      ${req('email', 'Email', 'name="email" type="email" autocomplete="email" placeholder="вы@email.com"')}
-      ${req('password', 'Пароль', 'name="new-password" type="password" autocomplete="new-password" placeholder="••••••••"')}
+      ${req('email', 'Email', 'name="email" type="email" autocomplete="email" placeholder="вы@email.com" autocapitalize="off" autocorrect="off" spellcheck="false" maxlength="254"')}
+      ${req('firstName', 'Имя', 'autocomplete="given-name" maxlength="100"')}
+      ${req('lastName', 'Фамилия', 'autocomplete="family-name" maxlength="100"')}
+      ${req('company', 'Предприятие / подразделение', 'autocomplete="organization" maxlength="100"')}
+      ${req('city', 'Город', 'autocomplete="address-level2" maxlength="100"')}
+      ${req('password', 'Пароль', 'name="new-password" type="password" autocomplete="new-password" placeholder="••••••••" maxlength="72"')}
       <div class="consent">
         <label class="tick-hit"><input type="checkbox" id="consent" aria-label="Я принимаю условия обработки персональных данных" /></label>
         <button type="button" class="link-btn" id="consentLink">Я принимаю условия обработки персональных данных</button>
@@ -247,6 +260,7 @@ function renderRegister() {
     const errorEl = document.getElementById('authError')
     errorEl.textContent = ''
     registerBtn.disabled = true
+    registerBtn.classList.add('busy')
     registerBtn.textContent = 'Регистрация…'
     try {
       const email = val('email')
@@ -256,7 +270,6 @@ function renderRegister() {
         options: {
           // handle_new_user() copies these into profiles; consent=true makes it stamp profiles.consented_at (server time).
           data: {
-            nickname: val('nickname'),
             first_name: val('firstName'),
             last_name: val('lastName'),
             company: val('company'),
@@ -276,6 +289,7 @@ function renderRegister() {
       renderEmailSent(email)
     } finally {
       registerBtn.disabled = false
+      registerBtn.classList.remove('busy')
       registerBtn.textContent = 'Присоединиться'
     }
   }
@@ -370,10 +384,11 @@ function renderEmailSent(email) {
   `
 }
 
-const pageHead = (title, back) => `
+// An activity page passes its icon (the one on its card in the list) to sit before the title.
+const pageHead = (title, back, icon = '') => `
   <header class="topbar"><div class="topbar-in">
     <button class="icon-btn" onclick="location.hash='${back}'" aria-label="Назад">${ICON.back}</button>
-    <h2>${title}</h2>
+    <h2>${icon ? `<span class="head-ico">${icon}</span>` : ''}${title}</h2>
   </div></header>
 `
 
@@ -391,7 +406,7 @@ function renderLoadError() {
 // Stations show their points, Диффузия and Колба идей show their own progress.
 const activityCard = ({ icon, name, right, done, doneLabel, href, kind = '' }) =>
   `<li class="station${done ? ' done' : ''}"${kind ? ` data-activity="${kind}"` : ''}>
-    <a class="station-link" href="${href}">
+    <a class="station-link" href="${escapeHtml(href)}">
       <div class="ico">${icon}</div>
       <div class="name">${escapeHtml(name)}${done ? `<small>${doneLabel}</small>` : ''}</div>
       <span class="pts">${right}</span>
@@ -408,13 +423,13 @@ const miniChain = (n, goal) =>
 async function renderDashboard(session) {
   const uid = session.user.id
   const [profile, stations, visits, progress, board] = await Promise.all([
-    supabase.from('profiles').select('first_name, last_name, nickname').eq('id', uid).single(),
+    supabase.from('profiles').select('first_name, last_name').eq('id', uid).single(),
     // Columns listed explicitly: qr_token has no business reaching the UI.
     supabase.from('stations').select('id, name, points, display_group').eq('is_active', true).order('created_at'),
     supabase.from('station_visits').select('station_id').eq('participant_id', uid),
     supabase.rpc('get_my_progress').single(),
-    // get_leaderboard is `stable`, so PostgREST lets .limit() chain onto it like a table.
-    supabase.rpc('get_leaderboard').limit(15),
+    // The top 10, plus the caller's own row when they are outside it: ranked by the database, in one call.
+    supabase.rpc('get_leaderboard'),
   ])
 
   // The leaderboard failing is non-fatal: the section shows its own message.
@@ -433,8 +448,7 @@ async function renderDashboard(session) {
   const name = fullName(profile.data)
   const visited = new Set(visits.data.map((v) => v.station_id))
   const { total_points, ideas_count, connections_count } = progress.data
-  knownConnections = connections_count
-  // Both counters stop at their goal: ideas beyond 5 are accepted but neither scored nor counted (see get_leaderboard()).
+  // Both counters stop at their goal: ideas beyond 5 are accepted but neither scored nor counted (see log_idea_points()).
   const ideas = Math.min(ideas_count, IDEA_GOAL)
   const links = Math.min(connections_count, DIFFUSION_GOAL)
 
@@ -461,7 +475,7 @@ async function renderDashboard(session) {
     const max = Math.max(...c.points)
     const polymer = c.group === 'polymer_solutions'
     return activityCard({
-      icon: polymer ? POLY_CHAIN : STATION_ICON[c.name] ? glyph(STATION_ICON[c.name]) : ICON.pin, name: c.name, done: c.done, doneLabel: 'Посещено',
+      icon: polymer ? POLY_CHAIN : stationIcon(c.name), name: c.name, done: c.done, doneLabel: 'Посещено',
       right: Math.min(...c.points) === max ? `+${max}` : `до +${max}`,
       href: polymer ? '#polymer' : `#station/${c.id}`,
     })
@@ -476,24 +490,17 @@ async function renderDashboard(session) {
 
   const rows = board.error ? [] : board.data
   const maxPts = rows[0]?.total_points || 1
-  const medals = ['🥇', '🥈', '🥉']
-  const rowHtml = rows.map((r, i) => {
-    const me = r.participant_id === uid
-    return `<li class="row${me ? ' me' : i < 3 ? ' top' : ''}">
-      <span class="rk${medals[i] ? ' medal' : ''}">${medals[i] || i + 1}</span>
+  const boardRow = (r) => `<li class="row${r.is_me ? ' me' : ''}">
+      <span class="rk">${r.rank}</span>
       <div class="who2">
-        <span class="nm">${escapeHtml(r.full_name)}${me ? ' (вы)' : ''}</span>
+        <span class="nm">${escapeHtml(r.full_name)}${r.is_me ? ' (вы)' : ''}</span>
         <div class="bar"><i style="width:${Math.round((r.total_points / maxPts) * 100)}%"></i></div>
       </div>
       <span class="sc">${r.total_points}<small>оч</small></span>
     </li>`
-  }).join('')
-  // Outside the top 15 the user still sees their own score.
-  const meOutside = !board.error && total_points > 0 && !rows.some((r) => r.participant_id === uid)
-    ? `<li class="row me gap"><span class="rk">…</span>
-        <div class="who2"><span class="nm">${escapeHtml(name)} (вы)</span></div>
-        <span class="sc">${total_points}<small>оч</small></span></li>`
-    : ''
+  const rowHtml = rows.slice(0, BOARD_SIZE).map(boardRow).join('')
+  // An 11th row exists only when the caller is outside the top 10: it goes below a gap, with their real rank.
+  const meOutside = rows[BOARD_SIZE] ? `<li class="board-gap" aria-hidden="true"></li>${boardRow(rows[BOARD_SIZE])}` : ''
 
   app.innerHTML = `
     <header class="topbar"><div class="topbar-in">
@@ -521,7 +528,7 @@ async function renderDashboard(session) {
         <ul class="stations">${stationHtml}</ul>
       </section>
       <section>
-        <div class="sec-head"><h3>Рейтинг участников</h3><span>Топ 15</span></div>
+        <div class="sec-head"><h3>Рейтинг участников</h3></div>
         ${board.error
           ? '<p class="error">Не удалось загрузить рейтинг участников. Попробуйте обновить страницу.</p>'
           : `<ul class="box board">${rowHtml}${meOutside}</ul>`}
@@ -551,25 +558,26 @@ async function renderProfile(session) {
   `
 }
 
-// ---- Полимер решений: описание игры (тексты из документа, см. content.js) ----
+// ---- Полимер решений: описание игры (тексты из документа, см. content.js), итог и кнопка сканирования ----
 
+// The people running the game hand each participant ONE placement QR (10 points for 1st place ... 1 for 10th). A participant earns from the
+// game once, whichever QR they scan: the result below is the placement they scanned, and the scan button goes once it is done.
 async function renderPolymer(session) {
+  const [group, visits] = await Promise.all([
+    supabase.from('stations').select('id, points').eq('display_group', 'polymer_solutions').eq('is_active', true),
+    supabase.from('station_visits').select('station_id').eq('participant_id', session.user.id),
+  ])
+  if (group.error || visits.error) return renderLoadError()
+  const visited = new Set(visits.data.map((v) => v.station_id))
+  const done = group.data.find((s) => visited.has(s.id))
   const p = POLYMER
   const bare = (s) => escapeHtml(s.replace(/[;.]$/, ''))
-  // The participant's own resources (random 0..5 each, assigned at registration by migration 5). If that migration is
-  // not applied yet the query fails and the page simply shows the game info without this block.
-  const mine = await supabase.from('profiles').select('resource_1, resource_2, resource_3, resource_4').eq('id', session.user.id).single()
-  const resources = mine.error ? '' : `
-      <section class="box pad">
-        <h3>${escapeHtml(RESOURCES_COPY.title)}</h3>
-        <ul class="resources">${RESOURCE_NAMES.map((name, i) => `<li><strong>${Number(mine.data[`resource_${i + 1}`])}</strong><span>${escapeHtml(name)}</span></li>`).join('')}</ul>
-        <p class="note">${escapeHtml(RESOURCES_COPY.note)}</p>
-      </section>`
   app.innerHTML = `
-    ${pageHead('Полимер решений', 'dashboard')}
+    ${pageHead('Полимер решений', 'dashboard', POLY_CHAIN)}
     <main class="page">
+      ${statCard('Баллы за игру', done ? `+${Number(done.points)}` : `до +${Math.max(0, ...group.data.map((s) => Number(s.points)))}`, done ? '<span class="badge">Пройдено</span>' : '')}
       <section class="poly-hero">${HERO_NET}<h3 class="brand">${escapeHtml(p.lead)}</h3></section>
-      <p class="note poly-intro">${escapeHtml(p.intro)}</p>${resources}
+      <p class="note poly-intro">${escapeHtml(p.intro)}</p>
       <section>
         <div class="sec-head"><h3>${escapeHtml(p.stepsTitle)}</h3></div>
         <ol class="chain">
@@ -587,7 +595,7 @@ async function renderPolymer(session) {
         <p class="eyebrow">${escapeHtml(p.flowLead)}</p>
         <p>${escapeHtml(p.flow)}</p>
       </section>
-      <button class="btn-cta" onclick="location.hash='scan'">${ICON.qr}Сканировать QR-код</button>
+      ${done ? '' : `<button class="btn-cta" onclick="location.hash='scan'">${ICON.qr}Сканировать QR-код</button>`}
     </main>
   `
 }
@@ -607,14 +615,14 @@ async function renderStation(session, id) {
   const s = station.data
   const copy = STATION_COPY[s.name] ?? STATION_DEFAULT
   app.innerHTML = `
-    ${pageHead(escapeHtml(s.name), 'dashboard')}
+    ${pageHead(escapeHtml(s.name), 'dashboard', stationIcon(s.name))}
     <main class="page">
       ${statCard('Баллы за станцию', `+${Number(s.points)}`, visit.data ? '<span class="badge">Посещено</span>' : '')}
       <section class="box pad desc">
         <h3 class="brand">${escapeHtml(copy.headline)}</h3>
         ${copy.paragraphs.map((t) => `<p class="note">${escapeHtml(t)}</p>`).join('')}
       </section>
-      <button class="btn-cta" onclick="location.hash='scan'">${ICON.qr}Сканировать QR-код</button>
+      ${hasOwnScanButton(s.name) ? `<button class="btn-cta" onclick="location.hash='scan'">${ICON.qr}Сканировать QR-код</button>` : ''}
     </main>
   `
 }
@@ -641,12 +649,11 @@ async function renderDiffusion(session) {
   if (progress.error || profile.error) return renderLoadError()
 
   const count = Math.min(progress.data.connections_count, DIFFUSION_GOAL)
-  knownConnections = progress.data.connections_count
   const complete = count >= DIFFUSION_GOAL
 
   // The count first, then what the activity is, then the three prompts. Nodes are filled per connection made.
   app.innerHTML = `
-    ${pageHead('Диффузия', 'dashboard')}
+    ${pageHead('Диффузия', 'dashboard', glyph(ACTIVITY_ICON.diffusion))}
     <main class="page">
       ${statCard('Связей', `${count} из ${DIFFUSION_GOAL}`, miniChain(count, DIFFUSION_GOAL))}
       <section class="box pad desc">
@@ -670,8 +677,10 @@ async function renderDiffusion(session) {
   document.querySelectorAll('.task .q').forEach((b) => { b.onclick = () => openQuestions(Number(b.dataset.i), b) })
 
   const qrBox = document.getElementById('qrBox')
-  document.getElementById('showQrBtn').onclick = async () => {
+  const showQrBtn = document.getElementById('showQrBtn')
+  showQrBtn.onclick = async () => {
     if (qrBox.firstChild) { qrBox.innerHTML = ''; return } // second tap hides it
+    showQrBtn.classList.add('busy')
     try {
       // Loaded on demand: the QR generator isn't needed anywhere else.
       const { default: QRCode } = await import('qrcode')
@@ -679,19 +688,21 @@ async function renderDiffusion(session) {
       qrBox.innerHTML = `<div class="box pad center"><img class="myqr" alt="Мой QR-код" src="${src}" /><p class="note">Покажите этот код участнику, с которым познакомились.</p></div>`
     } catch {
       qrBox.innerHTML = '<p class="error center">Не удалось создать QR-код. Попробуйте ещё раз.</p>'
+    } finally {
+      showQrBtn.classList.remove('busy')
     }
   }
 }
 
 async function handleDiffusionScan(decodedText) {
-  knownConnections ??= (await supabase.rpc('get_my_progress').single()).data?.connections_count ?? 0
+  // The count as it is NOW, not as the page last saw it: a connection is one row for both people, so the other person
+  // may have scanned this one since (then this scan is a repeat and must say so).
+  const before = Math.min((await supabase.rpc('get_my_progress').single()).data?.connections_count ?? 0, DIFFUSION_GOAL)
   const { data: count, error } = await supabase.rpc('confirm_diffusion_connection', { p_token: tokenFrom(decodedText) })
   if (error) {
     showModal({ title: 'Не удалось создать связь', message: translateError(error.message), variant: 'error', autoCloseMs: 3000, onClose: retryScan })
     return
   }
-  const before = knownConnections
-  knownConnections = count
   const toDiffusion = () => { window.location.hash = 'diffusion'; render() }
   if (count >= DIFFUSION_GOAL) {
     showModal({ message: 'Диффузия завершена. Вы создали 3 новых профессиональных связи.', autoCloseMs: 3000, onClose: toDiffusion })
@@ -710,7 +721,7 @@ async function renderIdeas(session) {
   if (progress.error) return renderLoadError()
   const n = Math.min(progress.data.ideas_count, IDEA_GOAL)
   app.innerHTML = `
-    ${pageHead('Колба идей', 'dashboard')}
+    ${pageHead('Колба идей', 'dashboard', glyph(ACTIVITY_ICON.ideas))}
     <main class="page">
       ${statCard('Идей', `${n} из ${IDEA_GOAL}`, miniChain(n, IDEA_GOAL))}
       <section class="box pad desc">
@@ -724,17 +735,18 @@ async function renderIdeas(session) {
 }
 
 const IDEA_FIELDS = [
-  ['title', 'Название идеи', 'input'],
-  ['direction', 'Направление идеи', 'input'],
-  ['problem', 'Какую проблему или задачу она решает', 'textarea'],
-  ['description', 'Описание', 'textarea'],
-  ['expected_result', 'Ожидаемый результат или эффект от внедрения', 'textarea'],
+  // [column, label, element, max length]: the lengths are the database's own CHECK limits
+  ['title', 'Название идеи', 'input', 200],
+  ['direction', 'Направление идеи', 'input', 200],
+  ['problem', 'Какую проблему или задачу она решает', 'textarea', 5000],
+  ['description', 'Описание', 'textarea', 5000],
+  ['expected_result', 'Ожидаемый результат или эффект от внедрения', 'textarea', 5000],
 ]
 
 const IDEA_FORM = `
   <form class="box form" id="ideaForm">
-    ${IDEA_FIELDS.map(([id, label, tag]) => `<div class="field"><label for="${id}">${label}</label>${
-      tag === 'input' ? `<input id="${id}" />` : `<textarea id="${id}" rows="4"></textarea>`}</div>`).join('')}
+    ${IDEA_FIELDS.map(([id, label, tag, max]) => `<div class="field"><label for="${id}">${label}</label>${
+      tag === 'input' ? `<input id="${id}" maxlength="${max}" />` : `<textarea id="${id}" rows="4" maxlength="${max}"></textarea>`}</div>`).join('')}
     <button type="submit" id="ideaBtn" disabled>Отправить идею</button>
     <p id="ideaError" class="error"></p>
   </form>`
@@ -751,7 +763,11 @@ function wireIdeaForm(session) {
     const errorEl = document.getElementById('ideaError')
     errorEl.textContent = ''
     btn.disabled = true
+    btn.classList.add('busy')
+    btn.textContent = 'Отправка…'
     const { error } = await supabase.from('ideas').insert({ author_id: session.user.id, ...values() })
+    btn.classList.remove('busy')
+    btn.textContent = 'Отправить идею'
     if (error) {
       errorEl.textContent = 'Не удалось отправить идею. Попробуйте ещё раз.'
       btn.disabled = false
@@ -777,8 +793,8 @@ function showModal({ title, message, variant = 'success', autoCloseMs, onClose, 
       <div class="modal-bar"></div>
       <div class="modal-body">
         <div class="round">${ICON[variant]}</div>
-        ${title ? `<h3 class="brand">${title}</h3>` : ''}
-        <p>${message}</p>
+        ${title ? `<h3 class="brand">${escapeHtml(title)}</h3>` : ''}
+        <p>${escapeHtml(message)}</p>
         <button id="modalCloseBtn">ОК</button>
       </div>
     </div>
@@ -812,12 +828,13 @@ async function stopActiveScanner() {
 // a scan screen (they may have pressed Назад during the 3s popup).
 const retryScan = () => { if (SCAN_ROUTES.includes(window.location.hash)) render() }
 
-// QR may encode a URL ending in the token, or just the raw token.
+// QR may encode a URL ending in the token, or just the raw token. A scanner can add spaces or a line break around it.
 function tokenFrom(decodedText) {
+  const text = decodedText.trim()
   try {
-    return new URL(decodedText).pathname.split('/').filter(Boolean).pop()
+    return new URL(text).pathname.split('/').filter(Boolean).pop() ?? text
   } catch {
-    return decodedText
+    return text
   }
 }
 
@@ -843,6 +860,9 @@ function renderScanner({ title, back, onDecoded }) {
       { fps: 10, qrbox: 250 },
       async (decodedText) => {
         await stopActiveScanner()
+        // The camera is off while the code is checked: say so instead of leaving a frozen viewfinder.
+        const hint = document.querySelector('.scan-page .hint')
+        if (hint) { hint.setAttribute('role', 'status'); hint.innerHTML = '<span class="spinner" aria-hidden="true"></span><br /><strong>Проверяем код…</strong>' }
         await onDecoded(decodedText)
       },
       () => {} // called every frame with no result found yet — intentionally silent
@@ -860,11 +880,11 @@ function renderScanner({ title, back, onDecoded }) {
 
 async function handleScan(decodedText) {
   const token = tokenFrom(decodedText)
-  // The station lookup (for its custom success message) doesn't depend on the
-  // scan result, so it runs alongside it instead of adding a round trip.
+  // The station's custom success message (looked up by token through an RPC: clients cannot read stations.qr_token)
+  // doesn't depend on the scan result, so it runs alongside it instead of adding a round trip.
   const [scan, station] = await Promise.all([
     supabase.rpc('scan_station', { p_token: token }),
-    supabase.from('stations').select('success_message').eq('qr_token', token).maybeSingle(),
+    supabase.rpc('station_success_message', { p_token: token }),
   ])
   if (scan.error) {
     // Decoded fine, but the backend rejected it (invalid token, inactive
@@ -894,9 +914,7 @@ async function handleScan(decodedText) {
   } else {
     showModal({
       title: 'Очки начислены!',
-      message: station.data?.success_message
-        ? escapeHtml(station.data.success_message)
-        : `+${points_awarded} очков — ваш счёт теперь ${total_points}.`,
+      message: station.data || `+${points_awarded} очков — ваш счёт теперь ${total_points}.`,
       variant: 'success',
       autoCloseMs: 3000,
       onClose: toDashboard,

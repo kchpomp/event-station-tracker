@@ -5,9 +5,8 @@
 // (a reload resets it) and nothing here touches the network.
 
 const ME = {
-  id: 'preview-user', nickname: 'preview', first_name: 'Валерий', last_name: 'Леонтьев',
+  id: 'preview-user', first_name: 'Валерий', last_name: 'Леонтьев',
   company: 'СИБУР Тобольск', city: 'Тобольск', personal_qr_token: 'preview-me',
-  resource_1: 3, resource_2: 0, resource_3: 5, resource_4: 2, // «Полимер решений» page
 }
 const PEOPLE = [ // scan these tokens on the Диффузия screen
   { token: 'preview-person-1', company: 'Полиом', city: 'Омск' },
@@ -15,24 +14,22 @@ const PEOPLE = [ // scan these tokens on the Диффузия screen
   { token: 'preview-person-3', company: 'Другое предприятие', city: 'Тобольск' },
   { token: 'preview-same-city-and-company', company: 'сибур тобольск ', city: 'тобольск' },
 ]
-const OTHERS = [
-  { participant_id: 'o1', full_name: 'Мария Соколова', total_points: 80, stations_completed: 4 },
-  { participant_id: 'o2', full_name: 'Игорь Волков', total_points: 55, stations_completed: 3 },
-  { participant_id: 'o3', full_name: 'Елена Орлова', total_points: 31, stations_completed: 2 },
-]
+// Twelve others, so the leaderboard shows its top 10 and then your own place below a gap.
+const OTHERS = ['Мария Соколова', 'Игорь Волков', 'Елена Орлова', 'Анна Белова', 'Дмитрий Захаров', 'Ольга Крылова', 'Сергей Мартынов', 'Наталья Фомина', 'Павел Дьячков', 'Ирина Власова', 'Алексей Громов', 'Татьяна Лебедева']
+  .map((full_name, i) => ({ full_name, total_points: 80 - i * 6 }))
 
 const station = (n, name, points, extra = {}) => ({ id: `s${n}`, name, points, qr_token: `preview-station-${n}`, is_active: true, display_group: null, success_message: null, ...extra })
+const POLYMER = 'polymer_solutions'
 const db = {
   profiles: [ME],
   stations: [
     station(1, 'Точка соединения', 1),
-    station(2, 'Полимер решений', 10, { display_group: 'polymer_solutions' }),
-    station(3, 'Полимер решений', 20, { display_group: 'polymer_solutions' }),
-    station(4, 'Полимер решений', 30, { display_group: 'polymer_solutions' }),
-    station(5, 'Люди формулы будущего', 1, { success_message: 'Спасибо! Вы стали частью «Людей Формулы будущего».' }),
-    station(6, 'Воркшоп 1', 1),
-    station(7, 'Воркшоп 2', 1),
-    station(8, 'Воркшоп 3', 1),
+    // ten placement QR codes, one card: 1st place = 10 points ... 10th = 1 (scan preview-station-2 for 1st place, -11 for 10th)
+    ...Array.from({ length: 10 }, (_, i) => station(2 + i, 'Полимер решений', 10 - i, { display_group: POLYMER, success_message: 'Спасибо за участие в «Полимере решений»!' })),
+    station(12, 'Люди формулы будущего', 1, { success_message: 'Спасибо! Вы стали частью «Людей Формулы будущего».' }),
+    station(13, 'Воркшоп 1', 1),
+    station(14, 'Воркшоп 2', 1),
+    station(15, 'Воркшоп 3', 1),
   ],
   station_visits: [{ participant_id: ME.id, station_id: 's1' }],
   ideas: [],
@@ -43,7 +40,7 @@ let signedIn = true
 
 const pointsOf = (id) => db.stations.find((s) => s.id === id).points
 const myPoints = () => db.station_visits.reduce((n, v) => n + pointsOf(v.station_id), 0) + Math.min(db.ideas.length, 5) + connections // idea = 1 (first 5 only), connection = 1 (placeholder weight), as in SQL
-const progress = () => ({ total_points: myPoints(), stations_completed: db.station_visits.length, ideas_count: db.ideas.length, connections_count: connections })
+const progress = () => ({ total_points: myPoints(), ideas_count: db.ideas.length, connections_count: connections })
 
 const done = (data, error = null) => ({ then: (ok, fail) => Promise.resolve({ data, error }).then(ok, fail) })
 const fail = (message) => done(null, { message })
@@ -55,7 +52,6 @@ function query(rows) {
     select: () => q,
     order: () => q,
     eq: (col, val) => { r = r.filter((x) => x[col] === val); return q },
-    limit: (n) => { r = r.slice(0, n); return q },
     single: () => (r.length === 1 ? done(r[0]) : fail('no single row')),
     maybeSingle: () => done(r[0] ?? null),
     insert: (row) => { rows.push({ id: `i${rows.length + 1}`, ...row }); return done(null) },
@@ -65,16 +61,21 @@ function query(rows) {
 }
 
 const rpcs = {
-  get_email_by_nickname: () => done('preview@example.test'),
   get_my_progress: () => query([progress()]),
-  get_leaderboard: () => query([...OTHERS, { participant_id: ME.id, full_name: `${ME.first_name} ${ME.last_name}`, ...progress() }]
-    .sort((a, b) => b.total_points - a.total_points)),
+  // the top 10 plus the caller's own row when outside it, ranked like the database does (equal points share a rank)
+  get_leaderboard: () => {
+    const all = [...OTHERS, { full_name: `${ME.first_name} ${ME.last_name}`, total_points: myPoints(), is_me: true }].sort((a, b) => b.total_points - a.total_points)
+    const rows = all.map((x) => ({ rank: 1 + all.filter((y) => y.total_points > x.total_points).length, full_name: x.full_name, total_points: x.total_points, is_me: !!x.is_me }))
+    return query(rows.filter((r, i) => i < 10 || r.is_me))
+  },
+  station_success_message: ({ p_token }) => done(db.stations.find((x) => x.qr_token === p_token)?.success_message ?? null),
   scan_station: ({ p_token }) => {
     const s = db.stations.find((x) => x.qr_token === p_token)
     if (!s) return fail('invalid station token')
-    const already = db.station_visits.some((v) => v.station_id === s.id)
+    // the same QR again, or any second «Полимер решений» QR (one award per person), awards nothing
+    const already = db.station_visits.some((v) => v.station_id === s.id || (s.display_group === POLYMER && db.stations.find((x) => x.id === v.station_id).display_group === POLYMER))
     if (!already) db.station_visits.push({ participant_id: ME.id, station_id: s.id })
-    return query([{ points_awarded: already ? 0 : s.points, total_points: myPoints(), stations_completed: db.station_visits.length, already_completed: already }])
+    return query([{ points_awarded: already ? 0 : s.points, total_points: myPoints(), already_completed: already }])
   },
   confirm_diffusion_connection: ({ p_token }) => {
     if (p_token === ME.personal_qr_token) return fail('cannot connect with yourself')

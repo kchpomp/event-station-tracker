@@ -59,14 +59,6 @@ export const STATION_DEFAULT = {
   ],
 }
 
-// «Полимер решений»: the participant's own resources. PLACEHOLDER NAMES: the concept document names no resource
-// types, so these are generic until the organizers decide (columns are profiles.resource_1..4).
-export const RESOURCE_NAMES = ['Ресурс 1', 'Ресурс 2', 'Ресурс 3', 'Ресурс 4']
-export const RESOURCES_COPY = {
-  title: 'Ваши ресурсы',
-  note: 'Ресурсы выдаются при регистрации, и у каждого участника свой набор. Договаривайтесь с командой: вместе у вас больше возможностей.',
-}
-
 export const DIFFUSION_COPY = {
   headline: 'Три новых знакомства до начала программы',
   paragraphs: [
